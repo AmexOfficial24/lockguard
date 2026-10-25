@@ -46,7 +46,7 @@ class MonitorService : Service() {
         const val ACTION_TEST_ALARM = "com.lockguard.ACTION_TEST_ALARM"
         const val ACTION_STOP_ALARM = "com.lockguard.ACTION_STOP_ALARM"
         const val STROBE_INTERVAL_MS = 150L
-        const val LOUDNESS_GAIN_MB = 3000
+        const val LOUDNESS_GAIN_MB = 4000
         private const val CHANNEL_ID = "lockguard_monitor"
         private const val NOTIF_ID = 1001
     }
