@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LockGuard</string>
+    <string name="admin_description">Lets LockGuard detect failed unlock attempts so it can sound an alarm.</string>
+</resources>
