@@ -20,12 +20,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
 /**
- * Minimal setup/control UI. Built programmatically to keep the project lean —
- * no layout XML or view binding needed.
+ * Minimal setup/control UI, built programmatically to keep the project lean.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var status: TextView
+    private lateinit var stealthButton: Button
     private lateinit var dpm: DevicePolicyManager
     private lateinit var admin: ComponentName
 
@@ -48,6 +48,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(button("2 · Start protection service") { startMonitor() })
         root.addView(button("3 · Ignore battery optimisations") { requestIgnoreBattery() })
         root.addView(spacer(pad))
+
+        stealthButton = button("Stealth mode") { toggleStealth() }
+        root.addView(stealthButton)
         root.addView(button("Test alarm now") { testAlarm() })
         root.addView(button("Stop alarm") { stopAlarm() })
         root.addView(button("View log / captures") {
@@ -55,9 +58,13 @@ class MainActivity : AppCompatActivity() {
         })
         root.addView(button("Disable device admin") { disableAdmin() })
 
-        setContentView(root)
+        setContentView(ScrollWrap(root))
         requestNeededPermissions()
     }
+
+    /** Wrap in a ScrollView so all controls are reachable on small screens. */
+    private fun ScrollWrap(content: View): View =
+        android.widget.ScrollView(this).apply { addView(content) }
 
     override fun onResume() {
         super.onResume()
@@ -66,16 +73,36 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshStatus() {
         val active = dpm.isAdminActive(admin)
+        val stealth = isStealth()
         status.text = buildString {
             append("Device admin: ")
             append(if (active) "ENABLED ✓" else "not enabled ✗")
-            append("\nTrigger: alarm after ")
+            append("\nMode: ")
+            append(if (stealth) "STEALTH — silent capture, no alarm" else "Alarm + capture")
+            append("\nTrigger: after ")
             append(LockMonitorAdmin.THRESHOLD)
             append(" failed unlocks")
-            append("\nAlarm length: ")
+            append("\nAlarm ")
             append(MonitorService.ALARM_DURATION_MS / 1000)
-            append("s on the alarm stream (max volume)")
+            append("s · recording ")
+            append(MonitorService.CAPTURE_AUDIO_MS / 1000)
+            append("s")
         }
+        stealthButton.text =
+            if (stealth) "Stealth mode: ON  (tap to disable)"
+            else "Stealth mode: OFF  (tap to enable)"
+    }
+
+    private fun isStealth(): Boolean =
+        getSharedPreferences(LockMonitorAdmin.PREFS, Context.MODE_PRIVATE)
+            .getBoolean(LockMonitorAdmin.KEY_STEALTH, false)
+
+    private fun toggleStealth() {
+        val next = !isStealth()
+        getSharedPreferences(LockMonitorAdmin.PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(LockMonitorAdmin.KEY_STEALTH, next).apply()
+        toast(if (next) "Stealth on — alarm silenced, capture still runs" else "Stealth off — alarm restored")
+        refreshStatus()
     }
 
     private fun enableAdmin() {
@@ -105,7 +132,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun testAlarm() {
         startMonitor()
-        sendBroadcast(Intent(MonitorService.ACTION_TRIGGER_ALARM).setPackage(packageName))
+        // Always plays, even in stealth mode, so you can test the siren.
+        sendBroadcast(Intent(MonitorService.ACTION_TEST_ALARM).setPackage(packageName))
     }
 
     private fun stopAlarm() {

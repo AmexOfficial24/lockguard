@@ -23,6 +23,7 @@ class LockMonitorAdmin : DeviceAdminReceiver() {
     companion object {
         const val PREFS = "lockguard_prefs"
         const val KEY_FAILS = "fail_count"
+        const val KEY_STEALTH = "stealth_mode"
         const val THRESHOLD = 3
     }
 
