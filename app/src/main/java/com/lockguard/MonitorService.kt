@@ -30,15 +30,16 @@ import androidx.core.content.ContextCompat
  * without tripping the background-start restrictions that would block a cold
  * service start.
  *
- * On [ACTION_TRIGGER_ALARM] it: forces the alarm stream to max, adds extra gain
- * with a [LoudnessEnhancer], plays the bundled siren looped for
- * [ALARM_DURATION_MS] under a wake lock, and kicks off the intruder capture
- * (front + back photos, 30s of mic audio). [ACTION_STOP_ALARM] stops the siren.
+ * On [ACTION_TRIGGER_ALARM] (a real intruder): plays the siren (unless stealth
+ * mode is on) and captures the intruder (front + back photos, 30s mic audio).
+ * [ACTION_TEST_ALARM] always plays the siren (for testing, ignores stealth).
+ * [ACTION_STOP_ALARM] stops the siren.
  */
 class MonitorService : Service() {
 
     companion object {
         const val ACTION_TRIGGER_ALARM = "com.lockguard.ACTION_TRIGGER_ALARM"
+        const val ACTION_TEST_ALARM = "com.lockguard.ACTION_TEST_ALARM"
         const val ACTION_STOP_ALARM = "com.lockguard.ACTION_STOP_ALARM"
         const val ALARM_DURATION_MS = 10_000L
         const val CAPTURE_AUDIO_MS = 30_000L
@@ -51,6 +52,7 @@ class MonitorService : Service() {
     private var player: MediaPlayer? = null
     private var loudness: LoudnessEnhancer? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var captureWakeLock: PowerManager.WakeLock? = null
     private val handler = Handler(Looper.getMainLooper())
     @Volatile private var alarmActive = false
 
@@ -58,6 +60,7 @@ class MonitorService : Service() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 ACTION_TRIGGER_ALARM -> onTrigger()
+                ACTION_TEST_ALARM -> soundAlarm()
                 ACTION_STOP_ALARM -> stopAlarm()
             }
         }
@@ -69,6 +72,7 @@ class MonitorService : Service() {
         goForeground()
         val filter = IntentFilter().apply {
             addAction(ACTION_TRIGGER_ALARM)
+            addAction(ACTION_TEST_ALARM)
             addAction(ACTION_STOP_ALARM)
         }
         ContextCompat.registerReceiver(
@@ -80,13 +84,21 @@ class MonitorService : Service() {
         goForeground()
         when (intent?.action) {
             ACTION_TRIGGER_ALARM -> onTrigger()
+            ACTION_TEST_ALARM -> soundAlarm()
             ACTION_STOP_ALARM -> stopAlarm()
         }
         return Service.START_STICKY
     }
 
+    /** Real intruder response: siren (unless stealth) + capture. */
     private fun onTrigger() {
-        soundAlarm()
+        val stealth = getSharedPreferences(LockMonitorAdmin.PREFS, Context.MODE_PRIVATE)
+            .getBoolean(LockMonitorAdmin.KEY_STEALTH, false)
+        if (stealth) {
+            AttemptLog.append(this, "Stealth mode — alarm suppressed, capturing silently")
+        } else {
+            soundAlarm()
+        }
         captureIntruder()
     }
 
@@ -190,6 +202,15 @@ class MonitorService : Service() {
             return
         }
         val dir = AttemptLog.newSession(this)
+        // Keep the CPU awake for the whole capture, even when the alarm (and its
+        // wake lock) isn't running — e.g. in stealth mode with the screen off.
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            captureWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lockguard:capture").apply {
+                setReferenceCounted(false)
+                acquire(CAPTURE_AUDIO_MS + 5_000L)
+            }
+        }
         AttemptLog.append(
             this,
             "Capture started [${dir.name}] camera=${if (cam) "on" else "off"} mic=${if (mic) "on" else "off"}"
@@ -204,6 +225,8 @@ class MonitorService : Service() {
 
     override fun onDestroy() {
         stopAlarm()
+        captureWakeLock?.let { if (it.isHeld) it.release() }
+        captureWakeLock = null
         runCatching { unregisterReceiver(triggerReceiver) }
         super.onDestroy()
     }
