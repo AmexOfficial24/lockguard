@@ -1,6 +1,7 @@
 package com.lockguard
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -13,6 +14,8 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.location.Location
+import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -25,18 +28,16 @@ import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import java.io.File
 
 /**
  * Persistent foreground service. Being already in the foreground is what lets it
- * use audio, the camera and the microphone on demand while the device is locked,
- * without tripping the background-start restrictions that would block a cold
- * service start.
+ * use audio, camera, mic and location on demand while the device is locked.
  *
- * On [ACTION_TRIGGER_ALARM] (a real intruder): plays the siren at the loudest the
- * hardware allows and strobes the camera flash (unless stealth mode is on), and
- * captures the intruder (front + back photos, 30s mic audio).
- * [ACTION_TEST_ALARM] always plays the siren + strobe (for testing).
- * [ACTION_STOP_ALARM] stops both.
+ * On [ACTION_TRIGGER_ALARM] (a real intruder): plays the siren + strobes the flash
+ * (unless stealth mode or the strobe toggle are off), logs the location (if
+ * enabled), and captures the intruder — a front video, or front+back photos +
+ * audio, per settings. Durations and the strobe come from [Prefs].
  */
 class MonitorService : Service() {
 
@@ -44,12 +45,7 @@ class MonitorService : Service() {
         const val ACTION_TRIGGER_ALARM = "com.lockguard.ACTION_TRIGGER_ALARM"
         const val ACTION_TEST_ALARM = "com.lockguard.ACTION_TEST_ALARM"
         const val ACTION_STOP_ALARM = "com.lockguard.ACTION_STOP_ALARM"
-        const val ALARM_DURATION_MS = 10_000L
-        const val CAPTURE_AUDIO_MS = 30_000L
         const val STROBE_INTERVAL_MS = 150L
-        // Extra gain on top of max volume, in millibels (100 mB = 1 dB).
-        // Pushed high enough that the already-maxed signal clips — i.e. as loud
-        // as the speaker physically goes.
         const val LOUDNESS_GAIN_MB = 3000
         private const val CHANNEL_ID = "lockguard_monitor"
         private const val NOTIF_ID = 1001
@@ -109,11 +105,8 @@ class MonitorService : Service() {
         return Service.START_STICKY
     }
 
-    /** Real intruder response: siren + strobe (unless stealth) + capture. */
     private fun onTrigger() {
-        val stealth = getSharedPreferences(LockMonitorAdmin.PREFS, Context.MODE_PRIVATE)
-            .getBoolean(LockMonitorAdmin.KEY_STEALTH, false)
-        if (stealth) {
+        if (Prefs.stealth(this)) {
             AttemptLog.append(this, "Stealth mode — alarm + flash suppressed, capturing silently")
         } else {
             soundAlarm()
@@ -131,6 +124,7 @@ class MonitorService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (hasPerm(Manifest.permission.CAMERA)) t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
             if (hasPerm(Manifest.permission.RECORD_AUDIO)) t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)) t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         }
         return t
     }
@@ -143,11 +137,12 @@ class MonitorService : Service() {
     private fun soundAlarm() {
         if (alarmActive) return
         alarmActive = true
+        val alarmMs = Prefs.alarmSecs(this) * 1000L
 
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lockguard:alarm").apply {
             setReferenceCounted(false)
-            acquire(ALARM_DURATION_MS + 2_000L)
+            acquire(alarmMs + 2_000L)
         }
 
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -186,8 +181,8 @@ class MonitorService : Service() {
             }
         }.onFailure { alarmActive = false }
 
-        startStrobe()
-        handler.postDelayed({ stopAlarm() }, ALARM_DURATION_MS)
+        if (Prefs.strobe(this)) startStrobe()
+        handler.postDelayed({ stopAlarm() }, alarmMs)
     }
 
     private fun stopAlarm() {
@@ -226,8 +221,8 @@ class MonitorService : Service() {
         strobeOn = false
     }
 
-    private fun sirenFile(): java.io.File {
-        val f = java.io.File(cacheDir, "siren.wav")
+    private fun sirenFile(): File {
+        val f = File(cacheDir, "siren.wav")
         if (!f.exists() || f.length() == 0L) {
             resources.openRawResource(R.raw.siren).use { input ->
                 f.outputStream().use { output -> input.copyTo(output) }
@@ -246,21 +241,60 @@ class MonitorService : Service() {
             return
         }
         val dir = AttemptLog.newSession(this)
+        val recMs = Prefs.recSecs(this) * 1000L
+
         runCatching {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             captureWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lockguard:capture").apply {
                 setReferenceCounted(false)
-                acquire(CAPTURE_AUDIO_MS + 5_000L)
+                acquire(recMs + 5_000L)
             }
         }
-        AttemptLog.append(
-            this,
-            "Capture started [${dir.name}] camera=${if (cam) "on" else "off"} mic=${if (mic) "on" else "off"}"
-        )
+
+        logLocation(dir)
+
+        val cap = IntruderCapture(this) { line -> AttemptLog.append(this, line) }
+        if (Prefs.video(this) && cam) {
+            AttemptLog.append(
+                this,
+                "Capture [${dir.name}]: front video ${Prefs.recSecs(this)}s${if (mic) " + audio" else ""}"
+            )
+            runCatching { cap.runVideo(dir, recMs, withAudio = mic) }
+                .onFailure { AttemptLog.append(this, "Video capture error (${it.javaClass.simpleName})") }
+        } else {
+            AttemptLog.append(
+                this,
+                "Capture [${dir.name}]: photos${if (mic) " + ${Prefs.recSecs(this)}s audio" else ""}"
+            )
+            runCatching { cap.run(dir, withCamera = cam, withAudio = mic, audioMs = recMs) }
+                .onFailure { AttemptLog.append(this, "Capture error (${it.javaClass.simpleName})") }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun logLocation(dir: File) {
+        if (!Prefs.location(this) || !hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)) return
         runCatching {
-            IntruderCapture(this) { line -> AttemptLog.append(this, line) }
-                .run(dir, withCamera = cam, withAudio = mic, audioMs = CAPTURE_AUDIO_MS)
-        }.onFailure { AttemptLog.append(this, "Capture error (${it.javaClass.simpleName})") }
+            val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            var best: Location? = null
+            for (p in lm.getProviders(true)) {
+                val l = runCatching { lm.getLastKnownLocation(p) }.getOrNull() ?: continue
+                if (best == null || l.time > best!!.time) best = l
+            }
+            if (best != null) {
+                val b = best!!
+                val ageS = (System.currentTimeMillis() - b.time) / 1000
+                val line = "Location ${b.latitude},${b.longitude} ±${b.accuracy.toInt()}m (age ${ageS}s)"
+                AttemptLog.append(this, line)
+                runCatching {
+                    File(dir, "location.txt").writeText(
+                        "$line\nhttps://maps.google.com/?q=${b.latitude},${b.longitude}\n"
+                    )
+                }
+            } else {
+                AttemptLog.append(this, "Location: no fix available")
+            }
+        }.onFailure { AttemptLog.append(this, "Location error (${it.javaClass.simpleName})") }
     }
 
     // ---------- Service plumbing ----------

@@ -23,11 +23,13 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Headless intruder capture from a foreground service: a still photo from the
- * front camera, then the back camera (sequential — most devices can't open both
- * at once), plus a fixed-length microphone recording. Everything is wrapped in
- * runCatching so a failure on one device/sensor never crashes the app; failures
- * are reported through [log].
+ * Headless intruder capture from a foreground service. Two modes:
+ *  - [run]: a still photo from the front camera, then the back camera, plus a
+ *    fixed-length microphone recording.
+ *  - [runVideo]: a front-camera video clip (with audio if the mic is granted).
+ *
+ * Everything is wrapped in runCatching so a failure on one device/sensor never
+ * crashes the app; failures are reported through [log].
  */
 class IntruderCapture(
     private val context: Context,
@@ -38,12 +40,10 @@ class IntruderCapture(
     private var recorder: MediaRecorder? = null
     private var cameraDone = false
     private var audioDone = false
-    private var withCamera = false
-    private var withAudio = false
+
+    // ================= Photo + audio mode =================
 
     fun run(dir: File, withCamera: Boolean, withAudio: Boolean, audioMs: Long) {
-        this.withCamera = withCamera
-        this.withAudio = withAudio
         handler.post {
             if (withAudio) startAudio(File(dir, "audio.m4a"), audioMs) else audioDone = true
             if (withCamera) {
@@ -65,15 +65,10 @@ class IntruderCapture(
         if (cameraDone && audioDone) runCatching { thread.quitSafely() }
     }
 
-    // ---------------- Audio ----------------
-
     @SuppressLint("MissingPermission")
     private fun startAudio(out: File, durationMs: Long) {
         runCatching {
-            val r = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                MediaRecorder(context)
-            else
-                @Suppress("DEPRECATION") MediaRecorder()
+            val r = newRecorder()
             recorder = r
             r.setAudioSource(MediaRecorder.AudioSource.MIC)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -100,8 +95,6 @@ class IntruderCapture(
             maybeQuit()
         }
     }
-
-    // ---------------- Camera ----------------
 
     @SuppressLint("MissingPermission")
     private fun captureFacing(facing: Int, out: File, onDone: () -> Unit) {
@@ -177,7 +170,6 @@ class IntruderCapture(
                                                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                                             }
                                         session.setRepeatingRequest(preview.build(), null, handler)
-                                        // let auto-exposure settle, then grab the still
                                         handler.postDelayed({
                                             runCatching {
                                                 runCatching { session.stopRepeating() }
@@ -257,6 +249,156 @@ class IntruderCapture(
             cleanup(null, null); finish()
         }
     }
+
+    // ================= Video mode =================
+
+    fun runVideo(dir: File, durationMs: Long, withAudio: Boolean) {
+        handler.post {
+            recordVideo(CameraCharacteristics.LENS_FACING_FRONT, File(dir, "video.mp4"), durationMs, withAudio) {
+                runCatching { thread.quitSafely() }
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun recordVideo(facing: Int, out: File, durationMs: Long, withAudio: Boolean, onDone: () -> Unit) {
+        val done = AtomicBoolean(false)
+        fun finish() { if (done.compareAndSet(false, true)) onDone() }
+
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val camId = runCatching {
+            cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == facing
+            }
+        }.getOrNull()
+        if (camId == null) { log("Video: no ${facingName(facing)} camera"); finish(); return }
+
+        val chars = cm.getCameraCharacteristics(camId)
+        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val sizes = map?.getOutputSizes(MediaRecorder::class.java)
+        val size = sizes?.minByOrNull {
+            kotlin.math.abs(it.width.toLong() * it.height - 1280L * 720L)
+        } ?: Size(1280, 720)
+
+        val r = newRecorder()
+        recorder = r
+        val prepared = runCatching {
+            if (withAudio) r.setAudioSource(MediaRecorder.AudioSource.MIC)
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setOutputFile(out.absolutePath)
+            r.setVideoEncodingBitRate(5_000_000)
+            r.setVideoFrameRate(30)
+            r.setVideoSize(size.width, size.height)
+            r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            if (withAudio) {
+                r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                r.setAudioSamplingRate(44_100)
+                r.setAudioEncodingBitRate(128_000)
+            }
+            val hint = if (facing == CameraCharacteristics.LENS_FACING_FRONT)
+                (sensorOrientation + 270) % 360 else (sensorOrientation + 90) % 360
+            r.setOrientationHint(hint)
+            r.prepare()
+        }.isSuccess
+        if (!prepared) {
+            log("Video: recorder prepare failed")
+            runCatching { r.release() }; recorder = null
+            finish(); return
+        }
+
+        val recorderSurface = r.surface
+        val previewSt = SurfaceTexture(0).apply { setDefaultBufferSize(size.width, size.height) }
+        val previewSurface = Surface(previewSt)
+
+        val cleaned = AtomicBoolean(false)
+        fun cleanup(camera: CameraDevice?, session: CameraCaptureSession?, started: Boolean) {
+            if (!cleaned.compareAndSet(false, true)) return
+            if (started) runCatching { r.stop() }
+            runCatching { session?.close() }
+            runCatching { camera?.close() }
+            runCatching { r.reset() }
+            runCatching { r.release() }
+            recorder = null
+            runCatching { previewSurface.release() }
+            runCatching { previewSt.release() }
+        }
+
+        val watchdog = Runnable {
+            if (!done.get()) { log("Video: timed out"); cleanup(null, null, false); finish() }
+        }
+        handler.postDelayed(watchdog, durationMs + 8_000L)
+
+        runCatching {
+            cm.openCamera(camId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    runCatching {
+                        camera.createCaptureSession(
+                            listOf(previewSurface, recorderSurface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    runCatching {
+                                        val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                            addTarget(previewSurface)
+                                            addTarget(recorderSurface)
+                                            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                                        }
+                                        session.setRepeatingRequest(req.build(), null, handler)
+                                        r.start()
+                                        log("Video: recording started (${durationMs / 1000}s)")
+                                        handler.postDelayed({
+                                            handler.removeCallbacks(watchdog)
+                                            cleanup(camera, session, true)
+                                            log("Video: saved")
+                                            finish()
+                                        }, durationMs)
+                                    }.onFailure {
+                                        log("Video: start failed")
+                                        handler.removeCallbacks(watchdog)
+                                        cleanup(camera, session, false); finish()
+                                    }
+                                }
+
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    log("Video: session config failed")
+                                    handler.removeCallbacks(watchdog)
+                                    cleanup(camera, session, false); finish()
+                                }
+                            },
+                            handler
+                        )
+                    }.onFailure {
+                        handler.removeCallbacks(watchdog)
+                        cleanup(camera, null, false); finish()
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    handler.removeCallbacks(watchdog)
+                    cleanup(camera, null, false); finish()
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    log("Video: camera error $error")
+                    handler.removeCallbacks(watchdog)
+                    cleanup(camera, null, false); finish()
+                }
+            }, handler)
+        }.onFailure {
+            log("Video: open failed (${it.javaClass.simpleName})")
+            handler.removeCallbacks(watchdog)
+            cleanup(null, null, false); finish()
+        }
+    }
+
+    // ================= helpers =================
+
+    private fun newRecorder(): MediaRecorder =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            MediaRecorder(context)
+        else
+            @Suppress("DEPRECATION") MediaRecorder()
 
     private fun facingName(f: Int): String =
         if (f == CameraCharacteristics.LENS_FACING_FRONT) "front" else "back"

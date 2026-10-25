@@ -11,9 +11,8 @@ import androidx.core.content.ContextCompat
  * res/xml/device_admin.xml, Android calls [onPasswordFailed] on every wrong
  * lock-screen attempt and [onPasswordSucceeded] on a correct one.
  *
- * Every failure is logged with a timestamp. At [THRESHOLD] consecutive
- * failures, [MonitorService] is signalled to sound the alarm and capture the
- * intruder (photos + audio).
+ * Every failure is logged with a timestamp. At the configured threshold,
+ * [MonitorService] is signalled to respond (alarm/strobe and intruder capture).
  *
  * Note: Android never exposes the actual credential the user typed to any app,
  * so the attempted passcode cannot be — and is not — recorded.
@@ -23,8 +22,6 @@ class LockMonitorAdmin : DeviceAdminReceiver() {
     companion object {
         const val PREFS = "lockguard_prefs"
         const val KEY_FAILS = "fail_count"
-        const val KEY_STEALTH = "stealth_mode"
-        const val THRESHOLD = 3
     }
 
     override fun onEnabled(context: Context, intent: Intent) {
@@ -40,10 +37,11 @@ class LockMonitorAdmin : DeviceAdminReceiver() {
         AttemptLog.append(context, "Failed unlock attempt #$fails")
         ensureMonitorRunning(context)
 
-        if (fails >= THRESHOLD) {
+        val threshold = Prefs.threshold(context)
+        if (fails >= threshold) {
             AttemptLog.append(
                 context,
-                "Threshold reached ($THRESHOLD) — alarm + intruder capture triggered"
+                "Threshold reached ($threshold) — response triggered"
             )
             context.sendBroadcast(
                 Intent(MonitorService.ACTION_TRIGGER_ALARM).setPackage(context.packageName)
