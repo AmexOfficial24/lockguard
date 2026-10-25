@@ -8,11 +8,15 @@ import androidx.core.content.ContextCompat
 
 /**
  * Device-admin receiver. With the `watch-login` policy declared in
- * res/xml/device_admin.xml, Android calls [onPasswordFailed] every time a wrong
- * lock-screen credential is entered, and [onPasswordSucceeded] on a correct one.
+ * res/xml/device_admin.xml, Android calls [onPasswordFailed] on every wrong
+ * lock-screen attempt and [onPasswordSucceeded] on a correct one.
  *
- * We keep a running count of consecutive failures and, at [THRESHOLD] or more,
- * signal [MonitorService] to sound the alarm.
+ * Every failure is logged with a timestamp. At [THRESHOLD] consecutive
+ * failures, [MonitorService] is signalled to sound the alarm and capture the
+ * intruder (photos + audio).
+ *
+ * Note: Android never exposes the actual credential the user typed to any app,
+ * so the attempted passcode cannot be — and is not — recorded.
  */
 class LockMonitorAdmin : DeviceAdminReceiver() {
 
@@ -23,6 +27,7 @@ class LockMonitorAdmin : DeviceAdminReceiver() {
     }
 
     override fun onEnabled(context: Context, intent: Intent) {
+        AttemptLog.append(context, "Device admin enabled")
         ensureMonitorRunning(context)
     }
 
@@ -31,17 +36,17 @@ class LockMonitorAdmin : DeviceAdminReceiver() {
         val fails = prefs.getInt(KEY_FAILS, 0) + 1
         prefs.edit().putInt(KEY_FAILS, fails).apply()
 
+        AttemptLog.append(context, "Failed unlock attempt #$fails")
         ensureMonitorRunning(context)
 
         if (fails >= THRESHOLD) {
-            // Warm path: the monitor is already a running foreground service,
-            // so a package-scoped broadcast reaches its registered receiver.
+            AttemptLog.append(
+                context,
+                "Threshold reached ($THRESHOLD) — alarm + intruder capture triggered"
+            )
             context.sendBroadcast(
                 Intent(MonitorService.ACTION_TRIGGER_ALARM).setPackage(context.packageName)
             )
-            // Cold path: (re)start the service directly with the trigger action,
-            // in case it was killed. Guarded because a background FGS start can
-            // be refused on a non-systemized install (see README).
             runCatching {
                 ContextCompat.startForegroundService(
                     context,
@@ -53,8 +58,12 @@ class LockMonitorAdmin : DeviceAdminReceiver() {
     }
 
     override fun onPasswordSucceeded(context: Context, intent: Intent, user: UserHandle) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putInt(KEY_FAILS, 0).apply()
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prev = prefs.getInt(KEY_FAILS, 0)
+        prefs.edit().putInt(KEY_FAILS, 0).apply()
+        if (prev > 0) {
+            AttemptLog.append(context, "Unlocked (after $prev failed attempt(s)) — counter reset")
+        }
     }
 
     private fun ensureMonitorRunning(context: Context) {

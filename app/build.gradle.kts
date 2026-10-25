@@ -11,13 +11,26 @@ android {
         applicationId = "com.lockguard"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
+    }
+
+    signingConfigs {
+        create("shared") {
+            storeFile = file("signing/lockguard.jks")
+            storePassword = "lockguard"
+            keyAlias = "lockguard"
+            keyPassword = "lockguard"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("shared")
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("shared")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

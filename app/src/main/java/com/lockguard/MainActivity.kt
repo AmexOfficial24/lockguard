@@ -4,6 +4,7 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -49,10 +50,13 @@ class MainActivity : AppCompatActivity() {
         root.addView(spacer(pad))
         root.addView(button("Test alarm now") { testAlarm() })
         root.addView(button("Stop alarm") { stopAlarm() })
+        root.addView(button("View log / captures") {
+            startActivity(Intent(this, LogActivity::class.java))
+        })
         root.addView(button("Disable device admin") { disableAdmin() })
 
         setContentView(root)
-        requestNotifPermissionIfNeeded()
+        requestNeededPermissions()
     }
 
     override fun onResume() {
@@ -122,10 +126,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestNotifPermissionIfNeeded() {
+    private fun requestNeededPermissions() {
+        val perms = mutableListOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+            perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
         }
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
     }
 
     private fun button(text: String, onClick: () -> Unit) = Button(this).apply {
