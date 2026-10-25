@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:   # lets you trigger a build manually from the Actions tab
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,14 +22,27 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Make gradlew executable
         run: chmod +x gradlew
 
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Publish APK to dist branch
+        continue-on-error: true
+        run: |
+          set -e
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          work=$(mktemp -d)
+          cp "$APK" "$work/LockGuard-debug.apk"
+          cd "$work"
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout -q -b dist
+          git add LockGuard-debug.apk
+          git commit -q -m "APK build ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" dist
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
