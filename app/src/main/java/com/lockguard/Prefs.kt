@@ -38,4 +38,7 @@ object Prefs {
 
     fun location(c: Context) = sp(c).getBoolean("location_enabled", false)
     fun setLocation(c: Context, v: Boolean) = sp(c).edit().putBoolean("location_enabled", v).apply()
+
+    fun overlay(c: Context) = sp(c).getBoolean("deterrent_overlay", false)
+    fun setOverlay(c: Context, v: Boolean) = sp(c).edit().putBoolean("deterrent_overlay", v).apply()
 }

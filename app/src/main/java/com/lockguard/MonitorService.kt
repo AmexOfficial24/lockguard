@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -31,13 +32,8 @@ import androidx.core.content.ContextCompat
 import java.io.File
 
 /**
- * Persistent foreground service. Being already in the foreground is what lets it
- * use audio, camera, mic and location on demand while the device is locked.
- *
- * On [ACTION_TRIGGER_ALARM] (a real intruder): plays the siren + strobes the flash
- * (unless stealth mode or the strobe toggle are off), logs the location (if
- * enabled), and captures the intruder — a front video, or front+back photos +
- * audio, per settings. Durations and the strobe come from [Prefs].
+ * Persistent foreground service: alarm, flash strobe, intruder capture, location
+ * logging, and the full-screen deterrent. All durations/toggles come from [Prefs].
  */
 class MonitorService : Service() {
 
@@ -45,10 +41,16 @@ class MonitorService : Service() {
         const val ACTION_TRIGGER_ALARM = "com.lockguard.ACTION_TRIGGER_ALARM"
         const val ACTION_TEST_ALARM = "com.lockguard.ACTION_TEST_ALARM"
         const val ACTION_STOP_ALARM = "com.lockguard.ACTION_STOP_ALARM"
+        const val ACTION_ALERT_DISMISS = "com.lockguard.ACTION_ALERT_DISMISS"
         const val STROBE_INTERVAL_MS = 150L
         const val LOUDNESS_GAIN_MB = 4000
+        // Battery-safety cap: when the deterrent overlay is on, the siren + screen
+        // run until the user authenticates OR this long, whichever comes first.
+        const val DETERRENT_MAX_MS = 120_000L
         private const val CHANNEL_ID = "lockguard_monitor"
+        private const val ALERT_CHANNEL_ID = "lockguard_alert"
         private const val NOTIF_ID = 1001
+        private const val NOTIF_ID_ALERT = 1002
     }
 
     private var player: MediaPlayer? = null
@@ -75,7 +77,7 @@ class MonitorService : Service() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 ACTION_TRIGGER_ALARM -> onTrigger()
-                ACTION_TEST_ALARM -> soundAlarm()
+                ACTION_TEST_ALARM -> soundAlarm(Prefs.alarmSecs(this@MonitorService) * 1000L)
                 ACTION_STOP_ALARM -> stopAlarm()
             }
         }
@@ -83,7 +85,7 @@ class MonitorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
+        createChannels()
         goForeground()
         val filter = IntentFilter().apply {
             addAction(ACTION_TRIGGER_ALARM)
@@ -99,7 +101,7 @@ class MonitorService : Service() {
         goForeground()
         when (intent?.action) {
             ACTION_TRIGGER_ALARM -> onTrigger()
-            ACTION_TEST_ALARM -> soundAlarm()
+            ACTION_TEST_ALARM -> soundAlarm(Prefs.alarmSecs(this) * 1000L)
             ACTION_STOP_ALARM -> stopAlarm()
         }
         return Service.START_STICKY
@@ -107,9 +109,12 @@ class MonitorService : Service() {
 
     private fun onTrigger() {
         if (Prefs.stealth(this)) {
-            AttemptLog.append(this, "Stealth mode — alarm + flash suppressed, capturing silently")
+            AttemptLog.append(this, "Stealth mode — alarm, flash & screen suppressed, capturing silently")
         } else {
-            soundAlarm()
+            val overlay = Prefs.overlay(this)
+            val dur = if (overlay) DETERRENT_MAX_MS else Prefs.alarmSecs(this) * 1000L
+            soundAlarm(dur)
+            if (overlay) showAlert()
         }
         captureIntruder()
     }
@@ -134,15 +139,14 @@ class MonitorService : Service() {
 
     // ---------- Alarm ----------
 
-    private fun soundAlarm() {
+    private fun soundAlarm(durationMs: Long) {
         if (alarmActive) return
         alarmActive = true
-        val alarmMs = Prefs.alarmSecs(this) * 1000L
 
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lockguard:alarm").apply {
             setReferenceCounted(false)
-            acquire(alarmMs + 2_000L)
+            acquire(durationMs + 2_000L)
         }
 
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -182,7 +186,7 @@ class MonitorService : Service() {
         }.onFailure { alarmActive = false }
 
         if (Prefs.strobe(this)) startStrobe()
-        handler.postDelayed({ stopAlarm() }, alarmMs)
+        handler.postDelayed({ stopAlarm() }, durationMs)
     }
 
     private fun stopAlarm() {
@@ -195,6 +199,31 @@ class MonitorService : Service() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         alarmActive = false
+        // Dismiss the deterrent overlay (if any) and its notification.
+        runCatching { getSystemService(NotificationManager::class.java).cancel(NOTIF_ID_ALERT) }
+        runCatching { sendBroadcast(Intent(ACTION_ALERT_DISMISS).setPackage(packageName)) }
+    }
+
+    // ---------- Deterrent overlay ----------
+
+    private fun showAlert() {
+        val fsIntent = Intent(this, AlertActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pi = PendingIntent.getActivity(
+            this, 0, fsIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle("Security alert")
+            .setContentText("This phone is being tracked and recorded")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setFullScreenIntent(pi, true)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .build()
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID_ALERT, n) }
+        runCatching { startActivity(fsIntent) }
     }
 
     // ---------- Flash strobe ----------
@@ -262,10 +291,8 @@ class MonitorService : Service() {
             runCatching { cap.runVideo(dir, recMs, withAudio = mic) }
                 .onFailure { AttemptLog.append(this, "Video capture error (${it.javaClass.simpleName})") }
         } else {
-            AttemptLog.append(
-                this,
-                "Capture [${dir.name}]: photos${if (mic) " + ${Prefs.recSecs(this)}s audio" else ""}"
-            )
+            val tail = if (mic) " + ${Prefs.recSecs(this)}s audio" else ""
+            AttemptLog.append(this, "Capture [${dir.name}]: photos$tail")
             runCatching { cap.run(dir, withCamera = cam, withAudio = mic, audioMs = recMs) }
                 .onFailure { AttemptLog.append(this, "Capture error (${it.javaClass.simpleName})") }
         }
@@ -309,14 +336,16 @@ class MonitorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun createChannel() {
+    private fun createChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                CHANNEL_ID,
-                "Protection",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply { setShowBadge(false) }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Protection", NotificationManager.IMPORTANCE_LOW)
+                    .apply { setShowBadge(false) }
+            )
+            nm.createNotificationChannel(
+                NotificationChannel(ALERT_CHANNEL_ID, "Security alert", NotificationManager.IMPORTANCE_HIGH)
+            )
         }
     }
 

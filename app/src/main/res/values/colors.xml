@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#B71C1C</color>
+    <color name="lg_red">#E53935</color>
+    <color name="lg_alert_bg">#B71C1C</color>
 </resources>
