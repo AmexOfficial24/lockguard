@@ -48,6 +48,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(button("3 · Ignore battery optimisations") { requestIgnoreBattery() })
         root.addView(spacer(pad))
         root.addView(button("Test alarm now") { testAlarm() })
+        root.addView(button("Stop alarm") { stopAlarm() })
         root.addView(button("Disable device admin") { disableAdmin() })
 
         setContentView(root)
@@ -101,6 +102,10 @@ class MainActivity : AppCompatActivity() {
     private fun testAlarm() {
         startMonitor()
         sendBroadcast(Intent(MonitorService.ACTION_TRIGGER_ALARM).setPackage(packageName))
+    }
+
+    private fun stopAlarm() {
+        sendBroadcast(Intent(MonitorService.ACTION_STOP_ALARM).setPackage(packageName))
     }
 
     private fun requestIgnoreBattery() {
