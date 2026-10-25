@@ -11,6 +11,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -30,10 +32,11 @@ import androidx.core.content.ContextCompat
  * without tripping the background-start restrictions that would block a cold
  * service start.
  *
- * On [ACTION_TRIGGER_ALARM] (a real intruder): plays the siren (unless stealth
- * mode is on) and captures the intruder (front + back photos, 30s mic audio).
- * [ACTION_TEST_ALARM] always plays the siren (for testing, ignores stealth).
- * [ACTION_STOP_ALARM] stops the siren.
+ * On [ACTION_TRIGGER_ALARM] (a real intruder): plays the siren at the loudest the
+ * hardware allows and strobes the camera flash (unless stealth mode is on), and
+ * captures the intruder (front + back photos, 30s mic audio).
+ * [ACTION_TEST_ALARM] always plays the siren + strobe (for testing).
+ * [ACTION_STOP_ALARM] stops both.
  */
 class MonitorService : Service() {
 
@@ -43,8 +46,11 @@ class MonitorService : Service() {
         const val ACTION_STOP_ALARM = "com.lockguard.ACTION_STOP_ALARM"
         const val ALARM_DURATION_MS = 10_000L
         const val CAPTURE_AUDIO_MS = 30_000L
+        const val STROBE_INTERVAL_MS = 150L
         // Extra gain on top of max volume, in millibels (100 mB = 1 dB).
-        const val LOUDNESS_GAIN_MB = 2000
+        // Pushed high enough that the already-maxed signal clips — i.e. as loud
+        // as the speaker physically goes.
+        const val LOUDNESS_GAIN_MB = 3000
         private const val CHANNEL_ID = "lockguard_monitor"
         private const val NOTIF_ID = 1001
     }
@@ -55,6 +61,19 @@ class MonitorService : Service() {
     private var captureWakeLock: PowerManager.WakeLock? = null
     private val handler = Handler(Looper.getMainLooper())
     @Volatile private var alarmActive = false
+
+    private var strobeCamId: String? = null
+    private var strobeOn = false
+    private val strobeRunnable = object : Runnable {
+        override fun run() {
+            val id = strobeCamId ?: return
+            strobeOn = !strobeOn
+            runCatching {
+                (getSystemService(Context.CAMERA_SERVICE) as CameraManager).setTorchMode(id, strobeOn)
+            }
+            handler.postDelayed(this, STROBE_INTERVAL_MS)
+        }
+    }
 
     private val triggerReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -90,19 +109,18 @@ class MonitorService : Service() {
         return Service.START_STICKY
     }
 
-    /** Real intruder response: siren (unless stealth) + capture. */
+    /** Real intruder response: siren + strobe (unless stealth) + capture. */
     private fun onTrigger() {
         val stealth = getSharedPreferences(LockMonitorAdmin.PREFS, Context.MODE_PRIVATE)
             .getBoolean(LockMonitorAdmin.KEY_STEALTH, false)
         if (stealth) {
-            AttemptLog.append(this, "Stealth mode — alarm suppressed, capturing silently")
+            AttemptLog.append(this, "Stealth mode — alarm + flash suppressed, capturing silently")
         } else {
             soundAlarm()
         }
         captureIntruder()
     }
 
-    /** Starts the foreground service declaring only the types we currently hold permission for. */
     private fun goForeground() {
         runCatching { startForeground(NOTIF_ID, buildNotification(), foregroundType()) }
             .onFailure { runCatching { startForeground(NOTIF_ID, buildNotification()) } }
@@ -168,11 +186,13 @@ class MonitorService : Service() {
             }
         }.onFailure { alarmActive = false }
 
+        startStrobe()
         handler.postDelayed({ stopAlarm() }, ALARM_DURATION_MS)
     }
 
     private fun stopAlarm() {
         handler.removeCallbacksAndMessages(null)
+        stopStrobe()
         loudness?.let { runCatching { it.enabled = false }; runCatching { it.release() } }
         loudness = null
         player?.run { runCatching { if (isPlaying) stop() }; release() }
@@ -180,6 +200,30 @@ class MonitorService : Service() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         alarmActive = false
+    }
+
+    // ---------- Flash strobe ----------
+
+    private fun startStrobe() {
+        val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        strobeCamId = runCatching {
+            cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+        }.getOrNull()
+        if (strobeCamId == null) return
+        strobeOn = false
+        handler.post(strobeRunnable)
+    }
+
+    private fun stopStrobe() {
+        handler.removeCallbacks(strobeRunnable)
+        strobeCamId?.let { id ->
+            runCatching {
+                (getSystemService(Context.CAMERA_SERVICE) as CameraManager).setTorchMode(id, false)
+            }
+        }
+        strobeOn = false
     }
 
     private fun sirenFile(): java.io.File {
@@ -202,8 +246,6 @@ class MonitorService : Service() {
             return
         }
         val dir = AttemptLog.newSession(this)
-        // Keep the CPU awake for the whole capture, even when the alarm (and its
-        // wake lock) isn't running — e.g. in stealth mode with the screen off.
         runCatching {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             captureWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lockguard:capture").apply {
