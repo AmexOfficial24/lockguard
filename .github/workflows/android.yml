@@ -26,7 +26,19 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
+
+      - name: Publish build log on failure
+        if: failure()
+        run: |
+          work=$(mktemp -d); cp /tmp/build.log "$work/build.log" || true
+          cd "$work"; git init -q
+          git config user.name "github-actions"; git config user.email "actions@github.com"
+          git checkout -q -b buildlog
+          git add build.log; git commit -q -m "build log ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" buildlog
 
       - name: Publish APK to dist branch
         continue-on-error: true
