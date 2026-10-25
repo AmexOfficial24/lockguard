@@ -63,20 +63,20 @@ class MonitorService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_TRIGGER_ALARM) soundAlarm()
-        return START_STICKY
+        return Service.START_STICKY
     }
 
     private fun soundAlarm() {
         if (alarmActive) return
         alarmActive = true
 
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lockguard:alarm").apply {
             setReferenceCounted(false)
             acquire(ALARM_DURATION_MS + 2_000L)
         }
 
-        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         am.setStreamVolume(
             AudioManager.STREAM_ALARM,
             am.getStreamMaxVolume(AudioManager.STREAM_ALARM),
